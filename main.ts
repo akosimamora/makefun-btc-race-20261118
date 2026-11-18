@@ -12,7 +12,7 @@
 //   - Sell at take-profit TP_BPS above cost, or stop-loss SL_BPS below cost,
 //     or after TIMEOUT_BARS bars without either. The bounce after a deep dip
 //     needs roughly 400 bars to mature (both replay windows: the winning
-//     trade took 383-439 bars to reach take-profit), so the timeout is 720
+//     trade took 407-443 bars to reach take-profit), so the timeout is 720
 //     bars (12h): long enough to let the swing develop, short enough that a
 //     missed take-profit still exits with a small gain instead of riding the
 //     position into the close.
@@ -25,6 +25,20 @@
 //     ~36 bps of round-trip cost, roughly 190 bps of equity; the brake sits
 //     just above one full stop-loss, so it stops the bleeding after a second
 //     consecutive loser instead of letting the bot buy every dip down.
+//   - Trailing take-profit: once the position peaks at least 140 bps above
+//     cost, sell if it gives back 60 bps from that peak. This covers the
+//     case where the swing tops out below the +175 bps take-profit: instead
+//     of riding it to the 720-bar timeout, the bot locks in peak minus 60.
+//     Arm and giveback are measured, not guessed. On both replay windows
+//     the swing retraces up to 62 bps while its peak sits in the 100-140
+//     bps zone, so an arm at 100 with a 60 bps giveback fires early and
+//     costs ~$12 on the old window (worst window +$16.67 -> +$4.45);
+//     above a 140 bps peak the largest retrace seen is 20 bps, so a
+//     60 bps giveback clears it with a 40 bps margin. With this trailing
+//     in place both windows are unchanged (+$16.71 / +$16.67: it never
+//     fires when the take-profit is hit), while in a simulated stalled
+//     swing (take-profit raised so it is never hit) the worst window
+//     improves from +$3.31 to +$9.95.
 //   - No fallback market buy: on both replay windows the deep-dip signal
 //     fired twice per window, so a no-trade window is unlikely, and a late
 //     trend-chasing buy would occupy the single position exactly when a real
@@ -56,6 +70,8 @@ const COOLDOWN_BARS = 10; // bars to wait after an exit before a new entry
 const MAX_SLIPPAGE_BPS = 100; // 1% past the close the order was decided on
 const BRAKE_BPS = 250n; // halt new entries at 2.5% below peak equity
 const RESUME_BPS = 50n; // resume entries at 0.5% below peak equity
+const TRAIL_ARM_BPS = 140n; // trailing take-profit arms once retBps peaks here
+const TRAIL_GIVEBACK_BPS = 60n; // exit if retBps falls this far below its peak
 const N_BARS = 1440; // bars per window (RULES: 1,440 one-minute bars)
 
 /** Floor division for bigints with a positive divisor (BigInt `/` truncates toward zero). */
@@ -70,6 +86,7 @@ let entrySeq = -1; // seq of the bar the open position was decided on
 let coolUntil = -1; // no new entry before this seq
 let peakEquity: bigint | null = null; // highest equity seen (quote units)
 let halted = false; // drawdown brake latched
+let peakRetBps = 0n; // highest retBps seen while the current position is open
 
 function rollingHigh(): bigint | null {
   return high.length > 0 ? high[0][1] : null;
@@ -99,18 +116,27 @@ await runBars({
 
     const held = state.positions.get(SYMBOL);
     if (held !== undefined) {
-      // Exit: take-profit, stop-loss, or timeout.
+      // Exit: take-profit, stop-loss, timeout, or trailing take-profit.
       const val = state.value(SYMBOL, held.qty);
       const cost = held.cost;
       const retBps = cost > 0n ? divFloor((val - cost) * BPS, cost) : 0n;
-      if (retBps >= TP_BPS || retBps <= -SL_BPS || seq - entrySeq >= TIMEOUT_BARS) {
+      if (retBps > peakRetBps) peakRetBps = retBps;
+      // Trailing take-profit: once the swing has peaked at least
+      // TRAIL_ARM_BPS above cost, lock the gain in if it gives back
+      // TRAIL_GIVEBACK_BPS from that peak, instead of riding a stalled
+      // swing to the 720-bar timeout.
+      const trailExit =
+        peakRetBps >= TRAIL_ARM_BPS && retBps <= peakRetBps - TRAIL_GIVEBACK_BPS;
+      if (retBps >= TP_BPS || retBps <= -SL_BPS || seq - entrySeq >= TIMEOUT_BARS || trailExit) {
         coolUntil = seq + COOLDOWN_BARS;
         return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
       return [];
     }
 
-    // Flat: no new entry while halted, cooling down, or too early.
+    // Flat: no position open, so the next trade's peak retBps starts at zero.
+    peakRetBps = 0n;
+    // No new entry while halted, cooling down, or too early.
     if (halted || seq < coolUntil || seq + 1 < HIGH_W) return [];
 
     const highClose = rollingHigh();
